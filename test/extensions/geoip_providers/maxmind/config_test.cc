@@ -22,6 +22,9 @@ using MaxmindProviderConfig = envoy::extensions::geoip_providers::maxmind::v3::M
 
 class GeoipProviderPeer {
 public:
+  static const absl::optional<std::string>& countryDbPath(const GeoipProvider& provider) {
+    return provider.config_->countryDbPath();
+  }
   static const absl::optional<std::string>& cityDbPath(const GeoipProvider& provider) {
     return provider.config_->cityDbPath();
   }
@@ -56,6 +59,17 @@ public:
     return provider.config_->anonHostingHeader();
   }
 };
+
+MATCHER_P(HasCountryDbPath, expected_db_path, "") {
+  auto provider = std::static_pointer_cast<GeoipProvider>(arg);
+  auto country_db_path = GeoipProviderPeer::countryDbPath(*provider);
+  if (country_db_path && testing::Matches(expected_db_path)(country_db_path.value())) {
+    return true;
+  }
+  *result_listener << "expected country_db_path=" << expected_db_path
+                   << " but country_db_path was not found in provider config";
+  return false;
+}
 
 MATCHER_P(HasCityDbPath, expected_db_path, "") {
   auto provider = std::static_pointer_cast<GeoipProvider>(arg);
@@ -202,11 +216,13 @@ TEST(MaxmindProviderConfigTest, ProviderConfigWithCorrectProto) {
         anon_tor: "x-anon-tor"
         anon_proxy: "x-anon-proxy"
         anon_hosting: "x-anon-hosting"
+    country_db_path: %s
     city_db_path: %s
     isp_db_path: %s
     anon_db_path: %s
   )EOF";
   MaxmindProviderConfig provider_config;
+  auto country_db_path = genGeoDbFilePath("GeoLite2-Country-Test.mmdb");
   auto city_db_path = genGeoDbFilePath("GeoLite2-City-Test.mmdb");
   auto asn_db_path = genGeoDbFilePath("GeoLite2-ASN-Test.mmdb");
   auto anon_db_path = genGeoDbFilePath("GeoIP2-Anonymous-IP-Test.mmdb");

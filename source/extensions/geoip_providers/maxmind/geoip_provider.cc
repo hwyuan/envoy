@@ -21,7 +21,9 @@ static constexpr const char* MMDB_ANON_LOOKUP_ARGS[] = {"is_anonymous", "is_anon
 GeoipProviderConfig::GeoipProviderConfig(
     const envoy::extensions::geoip_providers::maxmind::v3::MaxMindConfig& config,
     const std::string& stat_prefix, Stats::Scope& scope)
-    : city_db_path_(!config.city_db_path().empty() ? absl::make_optional(config.city_db_path())
+    : country_db_path_(!config.country_db_path().empty() ? absl::make_optional(config.country_db_path())
+                                                   : absl::nullopt),
+      city_db_path_(!config.city_db_path().empty() ? absl::make_optional(config.city_db_path())
                                                    : absl::nullopt),
       isp_db_path_(!config.isp_db_path().empty() ? absl::make_optional(config.isp_db_path())
                                                  : absl::nullopt),
@@ -55,9 +57,12 @@ GeoipProviderConfig::GeoipProviderConfig(
   anon_proxy_header_ = !geo_headers_to_add.anon_proxy().empty()
                            ? absl::make_optional(geo_headers_to_add.anon_proxy())
                            : absl::nullopt;
-  if (!city_db_path_ && !isp_db_path_ && !anon_db_path_) {
+  if (!country_db_path_ && !city_db_path_ && !isp_db_path_ && !anon_db_path_) {
     throw EnvoyException("At least one geolocation database path needs to be configured: "
-                         "city_db_path, isp_db_path or anon_db_path");
+                         "country_db_path_, city_db_path, isp_db_path or anon_db_path");
+  }
+  if (country_db_path_) {
+    registerGeoDbStats("country_db");
   }
   if (city_db_path_) {
     registerGeoDbStats("city_db");
@@ -87,6 +92,9 @@ void GeoipProviderConfig::incCounter(Stats::StatName name) {
 
 GeoipProvider::~GeoipProvider() {
   ENVOY_LOG(debug, "Shutting down Maxmind geolocation provider");
+  if (country_db_) {
+    MMDB_close(country_db_.get());
+  }
   if (city_db_) {
     MMDB_close(city_db_.get());
   }
@@ -116,10 +124,46 @@ void GeoipProvider::lookup(Geolocation::LookupRequest&& request,
                            Geolocation::LookupGeoHeadersCallback&& cb) const {
   auto& remote_address = request.remoteAddress();
   auto lookup_result = absl::flat_hash_map<std::string, std::string>{};
-  lookupInCityDb(remote_address, lookup_result);
+  // lookup countryDb only when city_db_path_ is not configured
+  if (!city_db_path_) {
+    lookupInCountryDb(remote_address, lookup_result);
+  } else {
+    lookupInCityDb(remote_address, lookup_result);
+  }
   lookupInAsnDb(remote_address, lookup_result);
   lookupInAnonDb(remote_address, lookup_result);
   cb(std::move(lookup_result));
+}
+
+void GeoipProvider::lookupInCountryDb(
+    const Network::Address::InstanceConstSharedPtr& remote_address,
+    absl::flat_hash_map<std::string, std::string>& lookup_result) const {
+  if (config_->isLookupEnabledForHeader(config_->countryHeader())) {
+    ASSERT(city_db_, "Maxmind country database is not initialised for performing lookups");
+    int mmdb_error;
+    const uint32_t n_prev_hits = lookup_result.size();
+    MMDB_lookup_result_s mmdb_lookup_result = MMDB_lookup_sockaddr(
+        city_db_.get(), reinterpret_cast<const sockaddr*>(remote_address->sockAddr()), &mmdb_error);
+    if (!mmdb_error) {
+      MMDB_entry_data_list_s* entry_data_list;
+      int status = MMDB_get_entry_data_list(&mmdb_lookup_result.entry, &entry_data_list);
+      if (status == MMDB_SUCCESS) {
+        if (config_->isLookupEnabledForHeader(config_->countryHeader())) {
+          populateGeoLookupResult(mmdb_lookup_result, lookup_result,
+                                  config_->countryHeader().value(), MMDB_COUNTRY_LOOKUP_ARGS[0],
+                                  MMDB_COUNTRY_LOOKUP_ARGS[1], MMDB_COUNTRY_LOOKUP_ARGS[2]);
+        }
+        if (lookup_result.size() > n_prev_hits) {
+          config_->incHit("country_db");
+        }
+        MMDB_free_entry_data_list(entry_data_list);
+      }
+
+    } else {
+      config_->incLookupError("country_db");
+    }
+    config_->incTotal("country_db");
+  }
 }
 
 void GeoipProvider::lookupInCityDb(
